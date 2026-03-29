@@ -27,15 +27,12 @@ type VaultProvider struct {
 func NewVaultProvider(cfg *VaultConfig) (*VaultProvider, error) {
 	vaultCfg := api.DefaultConfig()
 	vaultCfg.Address = cfg.Address
-	if cfg.TLS.CABundle != "" || cfg.TLS.CAFile != "" ||
-		cfg.TLS.ClientCert != "" || cfg.TLS.Insecure {
+	if cfg.TLS.CABundle != "" || cfg.TLS.CAFile != "" || cfg.TLS.ClientCert != "" || cfg.TLS.Insecure {
 		tlsCfg, err := BuildTLSConfig(cfg.TLS)
 		if err != nil {
 			return nil, fmt.Errorf("failed to configure TLS: %w", err)
 		}
-		vaultCfg.HttpClient = &http.Client{
-			Transport: &http.Transport{TLSClientConfig: tlsCfg},
-		}
+		vaultCfg.HttpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
 		log.Info("TLS configured successfully")
 	}
 	client, err := api.NewClient(vaultCfg)
@@ -61,11 +58,9 @@ func (v *VaultProvider) authenticate() error {
 		if v.config.RoleID == "" || v.config.SecretID == "" {
 			return fmt.Errorf("--role-id and --secret-id are required for approle auth")
 		}
-		data := map[string]interface{}{
-			"role_id":   v.config.RoleID,
-			"secret_id": v.config.SecretID,
-		}
-		resp, err := v.client.Logical().Write("auth/approle/login", data)
+		resp, err := v.client.Logical().Write("auth/approle/login", map[string]interface{}{
+			"role_id": v.config.RoleID, "secret_id": v.config.SecretID,
+		})
 		if err != nil {
 			return fmt.Errorf("approle login failed: %w", err)
 		}
@@ -81,23 +76,9 @@ func (v *VaultProvider) authenticate() error {
 }
 
 func (v *VaultProvider) FetchSecret(ctx context.Context, path, field, mountPath string) (string, error) {
-	if mountPath == "" {
-		mountPath = "secret"
-	}
-	secretPath := fmt.Sprintf("%s/data/%s", mountPath, path)
-	log.Infof("Fetching secret from Vault path: %s", secretPath)
-	secret, err := v.client.Logical().ReadWithContext(ctx, secretPath)
+	data, err := v.fetchData(ctx, path, mountPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read secret from Vault: %w", err)
-	}
-	if secret == nil {
-		return "", fmt.Errorf("secret not found at path: %s", secretPath)
-	}
-	var data map[string]interface{}
-	if kv2, ok := secret.Data["data"]; ok {
-		data = kv2.(map[string]interface{})
-	} else {
-		data = secret.Data
+		return "", err
 	}
 	if field != "" {
 		val, ok := data[field]
@@ -120,5 +101,56 @@ func (v *VaultProvider) FetchSecret(ctx context.Context, path, field, mountPath 
 			return str, nil
 		}
 	}
-	return "", fmt.Errorf("no suitable value found at path: %s", secretPath)
+	return "", fmt.Errorf("no suitable value found at path: %s", path)
+}
+
+func (v *VaultProvider) FetchSecretAllFields(ctx context.Context, path, mountPath string) (map[string]interface{}, error) {
+	return v.fetchData(ctx, path, mountPath)
+}
+
+func (v *VaultProvider) ListSecrets(ctx context.Context, path, mountPath string) ([]string, error) {
+	if mountPath == "" {
+		mountPath = "secret"
+	}
+	listPath := fmt.Sprintf("%s/metadata/%s", mountPath, path)
+	log.Infof("Listing secrets at Vault path: %s", listPath)
+	secret, err := v.client.Logical().ListWithContext(ctx, listPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list secrets: %w", err)
+	}
+	if secret == nil {
+		return nil, fmt.Errorf("no secrets found at path: %s", path)
+	}
+	keysRaw, ok := secret.Data["keys"]
+	if !ok {
+		return nil, fmt.Errorf("no keys returned at path: %s", path)
+	}
+	rawSlice, ok := keysRaw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected keys format at path: %s", path)
+	}
+	keys := make([]string, 0, len(rawSlice))
+	for _, k := range rawSlice {
+		keys = append(keys, fmt.Sprintf("%v", k))
+	}
+	return keys, nil
+}
+
+func (v *VaultProvider) fetchData(ctx context.Context, path, mountPath string) (map[string]interface{}, error) {
+	if mountPath == "" {
+		mountPath = "secret"
+	}
+	secretPath := fmt.Sprintf("%s/data/%s", mountPath, path)
+	log.Infof("Fetching secret from Vault path: %s", secretPath)
+	secret, err := v.client.Logical().ReadWithContext(ctx, secretPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read secret from Vault: %w", err)
+	}
+	if secret == nil {
+		return nil, fmt.Errorf("secret not found at path: %s", secretPath)
+	}
+	if kv2, ok := secret.Data["data"]; ok {
+		return kv2.(map[string]interface{}), nil
+	}
+	return secret.Data, nil
 }
