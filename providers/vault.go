@@ -2,8 +2,10 @@ package providers
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/hashicorp/vault/api"
 	log "github.com/sirupsen/logrus"
@@ -153,4 +155,87 @@ func (v *VaultProvider) fetchData(ctx context.Context, path, mountPath string) (
 		return kv2.(map[string]interface{}), nil
 	}
 	return secret.Data, nil
+}
+
+// WatchSecret polls a secret at the given interval and calls onChange when the value changes.
+// It uses SHA256 hashing to detect changes — the same pattern as CheckSecretChanged()
+// in swarm-external-secrets.
+func (v *VaultProvider) WatchSecret(ctx context.Context, path, field, mountPath string, interval time.Duration, onChange func(newValue string)) error {
+	data, err := v.fetchData(ctx, path, mountPath)
+	if err != nil {
+		return fmt.Errorf("initial fetch failed: %w", err)
+	}
+
+	current, err := extractField(data, field)
+	if err != nil {
+		return err
+	}
+	lastHash := hashValue(current)
+
+	log.Infof("Watching secret: %s (field: %s, interval: %s)", path, field, interval)
+	fmt.Printf("[%s] watching secret: %s\n", timestamp(), path)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Printf("[%s] watch stopped\n", timestamp())
+			return nil
+		case <-ticker.C:
+			data, err := v.fetchData(ctx, path, mountPath)
+			if err != nil {
+				fmt.Printf("[%s] error fetching secret: %v\n", timestamp(), err)
+				continue
+			}
+			val, err := extractField(data, field)
+			if err != nil {
+				fmt.Printf("[%s] error extracting field: %v\n", timestamp(), err)
+				continue
+			}
+			currentHash := hashValue(val)
+			if currentHash != lastHash {
+				fmt.Printf("[%s] SECRET CHANGED\n", timestamp())
+				lastHash = currentHash
+				onChange(val)
+			} else {
+				fmt.Printf("[%s] no change detected\n", timestamp())
+			}
+		}
+	}
+}
+
+func hashValue(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("%x", h)
+}
+
+func timestamp() string {
+	return time.Now().Format("2006-01-02 15:04:05")
+}
+
+func extractField(data map[string]interface{}, field string) (string, error) {
+	if field != "" {
+		val, ok := data[field]
+		if !ok {
+			available := make([]string, 0, len(data))
+			for k := range data {
+				available = append(available, k)
+			}
+			return "", fmt.Errorf("field %q not found; available: %v", field, available)
+		}
+		return fmt.Sprintf("%v", val), nil
+	}
+	for _, f := range []string{"value", "password", "secret", "data"} {
+		if val, ok := data[f]; ok {
+			return fmt.Sprintf("%v", val), nil
+		}
+	}
+	for _, val := range data {
+		if str, ok := val.(string); ok {
+			return str, nil
+		}
+	}
+	return "", fmt.Errorf("no suitable value found")
 }
